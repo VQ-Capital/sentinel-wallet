@@ -8,21 +8,30 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
-pub mod sentinel_protos {
+mod config;
+use config::WalletConfig;
+
+pub mod sentinel {
     pub mod execution {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
+        }
     }
     pub mod market {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.market.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.market.v1.rs"));
+        }
     }
     pub mod wallet {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.wallet.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.wallet.v1.rs"));
+        }
     }
 }
 
-use sentinel_protos::execution::ExecutionReport;
-use sentinel_protos::market::AggTrade;
-use sentinel_protos::wallet::EquitySnapshot;
+use sentinel::execution::v1::ExecutionReport;
+use sentinel::market::v1::AggTrade;
+use sentinel::wallet::v1::EquitySnapshot;
 
 #[derive(Clone, Default)]
 struct Position {
@@ -44,7 +53,7 @@ impl WalletState {
     fn new(initial_balance: f64) -> Self {
         Self {
             balance: initial_balance,
-            initial_balance, // Artık okunacak
+            initial_balance,
             peak_equity: initial_balance,
             trade_count: 0.0,
             sum_returns: 0.0,
@@ -76,8 +85,6 @@ impl WalletState {
             self.trade_count += 1.0;
             self.sum_returns += pct_return;
             self.sum_sq_returns += pct_return * pct_return;
-
-            // initial_balance burada okunarak dead_code uyarısı giderildi
             let total_growth = (self.balance / self.initial_balance - 1.0) * 100.0;
             info!(
                 "📈 Trade Closed: {} | Net PnL: ${:.4} | Total Growth: %{:.2}",
@@ -120,7 +127,7 @@ impl WalletState {
         if variance <= 0.0 {
             return 0.0;
         }
-        (mean / variance.sqrt()) * 15.81 // Yıllıklaştırma faktörü (252 trading gününe göre)
+        (mean / variance.sqrt()) * 15.81
     }
 }
 
@@ -128,26 +135,21 @@ impl WalletState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    let config = WalletConfig::from_env();
+
     info!(
-        "📡 Service: {} | Version: {}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
+        "📡 Service: {} | Version: 1.2.0 (V7 ENV-DRIVEN VCA)",
+        env!("CARGO_PKG_NAME")
     );
-
-    let nats_url =
-        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let init_bal: f64 = std::env::var("INITIAL_BALANCE")
-        .unwrap_or_else(|_| "10.0".to_string())
-        .parse()
-        .unwrap_or(10.0);
-
-    let nats_client = async_nats::connect(&nats_url).await.context("NATS Error")?;
+    let nats_client = async_nats::connect(&config.nats_url)
+        .await
+        .context("NATS Error")?;
     info!(
         "🏦 Sentinel Wallet (Institutional) Devrede. Capital: ${:.2}",
-        init_bal
+        config.initial_balance
     );
 
-    let state = Arc::new(RwLock::new(WalletState::new(init_bal)));
+    let state = Arc::new(RwLock::new(WalletState::new(config.initial_balance)));
     let live_prices = Arc::new(RwLock::new(HashMap::<String, f64>::new()));
 
     let (pc, nm) = (live_prices.clone(), nats_client.clone());
@@ -166,8 +168,7 @@ async fn main() -> Result<()> {
         if let Ok(mut sub) = ne.subscribe("execution.report.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(report) = ExecutionReport::decode(msg.payload) {
-                    let mut st = sc.write().await;
-                    st.process_report(&report);
+                    sc.write().await.process_report(&report);
                 }
             }
         }
