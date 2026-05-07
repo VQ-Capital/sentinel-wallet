@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let config = WalletConfig::from_env();
 
     info!(
-        "📡 Service: {} | Version: 1.2.0 (V7 ENV-DRIVEN VCA)",
+        "📡 Service: {} | Version: 1.3.0 (V8 MARKET-CLOCK VCA)",
         env!("CARGO_PKG_NAME")
     );
     let nats_client = async_nats::connect(&config.nats_url)
@@ -152,12 +152,24 @@ async fn main() -> Result<()> {
     let state = Arc::new(RwLock::new(WalletState::new(config.initial_balance)));
     let live_prices = Arc::new(RwLock::new(HashMap::<String, f64>::new()));
 
-    let (pc, nm) = (live_prices.clone(), nats_client.clone());
+    // ⏱️ TIME TRAVEL FIX: Wall-Clock iptal, Market-Clock aktif!
+    let latest_market_time = Arc::new(RwLock::new(0i64));
+
+    let (pc, mt, nm) = (
+        live_prices.clone(),
+        latest_market_time.clone(),
+        nats_client.clone(),
+    );
     tokio::spawn(async move {
         if let Ok(mut sub) = nm.subscribe("market.trade.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(t) = AggTrade::decode(msg.payload) {
                     pc.write().await.insert(t.symbol, t.price);
+
+                    let mut time_lock = mt.write().await;
+                    if t.timestamp > *time_lock {
+                        *time_lock = t.timestamp;
+                    }
                 }
             }
         }
@@ -174,10 +186,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (sp, pp, np) = (state.clone(), live_prices.clone(), nats_client.clone());
+    let (sp, pp, mt2, np) = (
+        state.clone(),
+        live_prices.clone(),
+        latest_market_time.clone(),
+        nats_client.clone(),
+    );
     tokio::spawn(async move {
         loop {
+            // Loop hızı wall-clock üzerinden olabilir, ancak bastığımız "timestamp" Borsa saati olmak ZORUNDADIR.
             sleep(Duration::from_millis(500)).await;
+
+            let market_clock = *mt2.read().await;
+            if market_clock == 0 {
+                continue;
+            } // Sistem veri görene kadar bekle
+
             let (total_equity, margin, un_pnl, max_dd, sharpe) = {
                 let mut st = sp.write().await;
                 let pr = pp.read().await;
@@ -210,7 +234,7 @@ async fn main() -> Result<()> {
                 total_equity_usd: total_equity,
                 available_margin_usd: margin,
                 total_unrealized_pnl: un_pnl,
-                timestamp: chrono::Utc::now().timestamp_millis(),
+                timestamp: market_clock, // 🚀 BÜYÜK DÜZELTME BURADA: chrono::Utc::now() KALDIRILDI!
                 is_reconciled: false,
                 max_drawdown_pct: max_dd,
                 sharpe_ratio: sharpe,
